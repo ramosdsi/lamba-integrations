@@ -1,0 +1,80 @@
+import os
+import json
+import datetime
+import urllib3
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+
+SERVICE_ACCOUNT_FILE = "/tmp/service_account.json"
+DELEGATED_ADMIN = os.environ.get("DELEGATED_ADMIN")
+LOGSCALE_URL = os.environ.get("LOGSCALE_URL")
+LOGSCALE_TOKEN = os.environ.get("LOGSCALE_TOKEN")
+APPLICATIONS = os.environ.get("APPLICATIONS", "login,drive").split(",")
+
+http = urllib3.PoolManager()
+
+def lambda_handler(event, context):
+    try:
+        # Grava credenciais no /tmp
+        sa_json = os.environ.get("SERVICE_ACCOUNT_JSON")
+        if not sa_json:
+            raise ValueError("Variável SERVICE_ACCOUNT_JSON não encontrada")
+        
+        with open(SERVICE_ACCOUNT_FILE, "w") as f:
+            f.write(sa_json)
+        
+        # Credenciais com delegação
+        creds = service_account.Credentials.from_service_account_file(
+            SERVICE_ACCOUNT_FILE,
+            scopes=["https://www.googleapis.com/auth/admin.reports.audit.readonly"]
+        ).with_subject(DELEGATED_ADMIN)
+        
+        service = build("admin", "reports_v1", credentials=creds)
+
+        # Últimos 5 minutos em UTC
+        start_time = (datetime.datetime.utcnow() - datetime.timedelta(minutes=5)) \
+            .replace(microsecond=0).isoformat() + "Z"
+        
+        headers = {
+            "Authorization": f"Bearer {LOGSCALE_TOKEN}",
+            "Content-Type": "application/json"
+        }
+
+        for app in APPLICATIONS:
+            page_token = None
+            while True:
+                results = service.activities().list(
+                    userKey="all",
+                    applicationName=app.strip(),
+                    startTime=start_time,
+                    pageToken=page_token
+                ).execute()
+                
+                for item in results.get("items", []):
+                    payload = json.dumps({
+                        "timestamp": item.get("id", {}).get("time"),
+                        "attributes": item
+                    })
+                    
+                    resp = http.request(
+                        "POST",
+                        LOGSCALE_URL,
+                        body=payload,
+                        headers=headers
+                    )
+                    
+                    if resp.status >= 400:
+                        raise Exception(
+                            f"Erro ao enviar para LogScale: {resp.status}, {resp.data.decode('utf-8')}"
+                        )
+                
+                # Verifica se há mais páginas
+                page_token = results.get("nextPageToken")
+                if not page_token:
+                    break
+
+        return {"status": "OK"}
+    
+    except Exception as e:
+        print(f"Erro na execução da Lambda: {str(e)}")
+        raise
